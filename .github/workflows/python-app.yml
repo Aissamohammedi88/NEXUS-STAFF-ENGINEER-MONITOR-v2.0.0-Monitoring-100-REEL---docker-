@@ -1,0 +1,188 @@
+# This workflow will install Python dependencies, run tests and lint with a single version of Python
+# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-python
+
+name: Python application
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v3
+      with:
+        python-version: "3.10"
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install flake8 pytest
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+    - name: Lint with flake8
+      run: |
+        # stop the build if there are Python syntax errors or undefined names
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
+        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+    - name: Test with pytest
+      run: |
+        pytest
+# NEXUS Python Orchestrator - Kubernetes Manifest
+# Author: Aissa Mohammedi (DGK)
+# Service: Python Orchestrator API - Port 8000
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+name: nexus-python
+namespace: nexus-prod
+labels:
+app: nexus-python
+tier: orchestrator
+language: python
+version: "2.0.0"
+spec:
+replicas: 2
+strategy:
+type: RollingUpdate
+rollingUpdate:
+maxSurge: 1
+maxUnavailable: 0
+selector:
+matchLabels:
+app: nexus-python
+template:
+metadata:
+labels:
+app: nexus-python
+tier: orchestrator
+spec:
+containers:
+- name: nexus-python
+image: nexus-python:latest
+imagePullPolicy: IfNotPresent
+ports:
+- containerPort: 8000
+name: http
+protocol: TCP
+env:
+- name: PORT
+value: "8000"
+- name: DATABASE_URL
+valueFrom:
+secretKeyRef:
+name: nexus-secrets
+key: database-url
+- name: REDIS_URL
+valueFrom:
+secretKeyRef:
+name: nexus-secrets
+key: redis-url
+- name: ENV
+value: "production"
+livenessProbe:
+httpGet:
+path: /health
+port: 8000
+initialDelaySeconds: 15
+periodSeconds: 10
+timeoutSeconds: 5
+failureThreshold: 3
+readinessProbe:
+httpGet:
+path: /health
+port: 8000
+initialDelaySeconds: 5
+periodSeconds: 5
+timeoutSeconds: 3
+failureThreshold: 3
+resources:
+requests:
+cpu: "250m"
+memory: "256Mi"
+limits:
+cpu: "1000m"
+memory: "512Mi"
+securityContext:
+allowPrivilegeEscalation: false
+readOnlyRootFilesystem: true
+runAsNonRoot: true
+runAsUser: 1000
+---
+apiVersion: v1
+kind: Service
+metadata:
+name: nexus-python-service
+namespace: nexus-prod
+labels:
+app: nexus-python
+spec:
+type: ClusterIP
+selector:
+app: nexus-python
+ports:
+- name: http
+port: 8000
+targetPort: 8000
+protocol: TCP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+name: nexus-python-hpa
+namespace: nexus-prod
+spec:
+scaleTargetRef:
+apiVersion: apps/v1
+kind: Deployment
+name: nexus-python
+minReplicas: 2
+maxReplicas: 6
+metrics:
+- type: Resource
+resource:
+name: cpu
+target:
+type: Utilization
+averageUtilization: 70
+- type: Resource
+resource:
+name: memory
+target:
+type: Utilization
+averageUtilization: 80
+
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends wget && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+EXPOSE 8000
+
+USER 1000
+
+HEALTHCHECK --interval=15s --timeout=5s --retries=3 \
+CMD wget --no-verbose --tries=1 --spider http://127.0.0.1:8000/health || exit 1
+
+CMD ["python", "app.py"]
+
+
+
+kubectl apply -f nexus-python/python-app.yml
+kubectl get pods -n nexus-prod -l app=nexus-python
