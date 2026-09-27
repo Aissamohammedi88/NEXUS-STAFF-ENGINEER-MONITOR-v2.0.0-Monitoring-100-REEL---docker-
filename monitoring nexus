@@ -1,0 +1,1383 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# NEXUS STAFF ENGINEER MONITOR v2.0.0
+# Monitoring 100% REEL - docker stats, postgres, redis, HTTP endpoints
+# Zero simulation. Chaque metrique vient d'une source reelle.
+# Auteur : Aissa Mohammedi (DGK)
+# Licence : NEXUS-OPEN-2.0
+
+import os
+import re
+import sys
+import ssl
+import json
+import time
+import gzip
+import socket
+import shutil
+import hashlib
+import threading
+import subprocess
+import urllib.request
+import urllib.error
+import collections
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+VERSION = "2.0.0"
+AUTEUR = "Aissa Mohammedi (DGK)"
+LICENCE = "NEXUS-OPEN-2.0"
+
+HOME = os.path.expanduser("~")
+BASE = os.path.join(HOME, "Documents", "nexus_staff_monitor")
+os.makedirs(BASE, exist_ok=True)
+LOGS_DIR = os.path.join(BASE, "logs")
+os.makedirs(LOGS_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOGS_DIR, "monitor.log")
+
+PORT = 8088
+
+CTX = ssl.create_default_context()
+CTX.check_hostname = False
+CTX.verify_mode = ssl.CERT_NONE
+
+LOG_LOCK = threading.RLock()
+
+
+def log(msg, level="INFO"):
+ts = datetime.now(timezone.utc).isoformat()
+line = "[" + ts + "] [" + level + "] " + str(msg)
+with LOG_LOCK:
+try:
+print(line, flush=True)
+except Exception:
+pass
+try:
+with open(LOG_FILE, "a", encoding="utf-8") as f:
+f.write(line + "\n")
+except OSError:
+pass
+
+
+# ===============================================================
+# CONFIGURATION DES SERVICES
+# ===============================================================
+
+SERVICES = [
+{
+"id": "postgres",
+"nom": "PostgreSQL",
+"langage": "SQL",
+"port": 5432,
+"role": "Primary Data Store",
+"couleur": "#336791",
+"container": "nexus-postgres",
+"health_url": None,
+},
+{
+"id": "redis",
+"nom": "Redis",
+"langage": "C",
+"port": 6379,
+"role": "Cache & Event Queue",
+"couleur": "#dc382d",
+"container": "nexus-redis",
+"health_url": None,
+},
+{
+"id": "nexus-python",
+"nom": "Python Orchestrator",
+"langage": "Python",
+"port": 8000,
+"role": "Orchestrator + API",
+"couleur": "#3776ab",
+"container": "nexus-python",
+"health_url": "http://127.0.0.1:8000/health",
+},
+{
+"id": "nexus-java",
+"nom": "Java Task Service",
+"langage": "Java",
+"port": 8080,
+"role": "Task Service",
+"couleur": "#f89820",
+"container": "nexus-java",
+"health_url": "http://127.0.0.1:8080/actuator/health",
+},
+{
+"id": "nexus-go",
+"nom": "Go Worker",
+"langage": "Go",
+"port": 8001,
+"role": "Worker Service",
+"couleur": "#00add8",
+"container": "nexus-go",
+"health_url": "http://127.0.0.1:8001/health",
+},
+{
+"id": "nexus-rust",
+"nom": "Rust Validator",
+"langage": "Rust",
+"port": 3000,
+"role": "Validator Service",
+"couleur": "#dea584",
+"container": "nexus-rust",
+"health_url": "http://127.0.0.1:3000/health",
+},
+{
+"id": "nexus-ts",
+"nom": "TypeScript Frontend",
+"langage": "TypeScript",
+"port": 3001,
+"role": "Frontend API",
+"couleur": "#3178c6",
+"container": "nexus-ts",
+"health_url": "http://127.0.0.1:3001/health",
+},
+]
+
+
+# ===============================================================
+# UTILITAIRES SYSTEME
+# ===============================================================
+
+def executer_commande(cmd, timeout=5):
+"""Execute une commande et retourne (code, stdout, stderr)."""
+try:
+r = subprocess.run(
+cmd,
+capture_output=True,
+text=True,
+timeout=timeout
+)
+return r.returncode, r.stdout or "", r.stderr or ""
+except subprocess.TimeoutExpired:
+return -1, "", "timeout"
+except FileNotFoundError:
+return -2, "", "commande introuvable"
+except Exception as e:
+return -3, "", str(e)[:200]
+
+
+def commande_dispo(nom):
+"""Verifie si une commande est disponible dans le PATH."""
+return shutil.which(nom) is not None
+
+
+def verifier_port_tcp(host, port, timeout=0.5):
+"""Teste si un port TCP accepte les connexions."""
+try:
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(timeout)
+t0 = time.time()
+result = s.connect_ex((host, port))
+dt = (time.time() - t0) * 1000
+s.close()
+return {
+"ouvert": result == 0,
+"latence_ms": round(dt, 2) if result == 0 else 0,
+}
+except Exception as e:
+return {"ouvert": False, "latence_ms": 0, "erreur": str(e)[:80]}
+
+
+# ===============================================================
+# DOCKER STATS REELS
+# ===============================================================
+
+DOCKER_DISPONIBLE = commande_dispo("docker")
+
+
+def docker_container_stats(nom_container):
+"""
+Recupere les stats reelles d'un container Docker.
+Retourne CPU %, RAM Mo, etc. ou None si indisponible.
+"""
+if not DOCKER_DISPONIBLE:
+return None
+
+code, out, err = executer_commande(
+["docker", "stats", "--no-stream", "--format",
+"{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}|{{.NetIO}}|{{.BlockIO}}",
+nom_container],
+timeout=5
+)
+
+if code != 0 or not out.strip():
+return None
+
+try:
+parties = out.strip().split("|")
+if len(parties) < 5:
+return None
+
+cpu_str = parties[0].replace("%", "").strip()
+mem_usage = parties[1].split("/")[0].strip()
+mem_pct = parties[2].replace("%", "").strip()
+net_io = parties[3].strip()
+block_io = parties[4].strip()
+
+# Parse CPU
+try:
+cpu_pct = float(cpu_str)
+except ValueError:
+cpu_pct = 0.0
+
+# Parse RAM (format "123.4MiB" ou "1.5GiB" ou "256KiB")
+ram_mo = 0.0
+m = re.match(r"^([\d.]+)\s*([KMG]i?B)$", mem_usage, re.IGNORECASE)
+if m:
+val = float(m.group(1))
+unite = m.group(2).upper()
+if unite in ("KIB", "KB"):
+ram_mo = val / 1024
+elif unite in ("MIB", "MB"):
+ram_mo = val
+elif unite in ("GIB", "GB"):
+ram_mo = val * 1024
+
+try:
+mem_pct_val = float(mem_pct)
+except ValueError:
+mem_pct_val = 0.0
+
+return {
+"cpu_pct": round(cpu_pct, 2),
+"ram_mo": round(ram_mo, 1),
+"ram_pct": round(mem_pct_val, 2),
+"net_io": net_io,
+"block_io": block_io,
+"source": "docker_stats",
+}
+except Exception as e:
+log("Erreur parse docker stats " + nom_container + " : " + str(e)[:80], "WARN")
+return None
+
+
+def docker_container_inspect(nom_container):
+"""Verifie si un container existe et son etat."""
+if not DOCKER_DISPONIBLE:
+return None
+
+code, out, err = executer_commande(
+["docker", "inspect", "--format",
+"{{.State.Status}}|{{.State.StartedAt}}|{{.RestartCount}}|{{.State.Health.Status}}",
+nom_container],
+timeout=5
+)
+
+if code != 0:
+return None
+
+try:
+parties = out.strip().split("|")
+if len(parties) < 3:
+return None
+
+status = parties[0]
+started_at = parties[1]
+restart_count = int(parties[2]) if parties[2].isdigit() else 0
+health = parties[3] if len(parties) > 3 else "unknown"
+
+# Uptime
+uptime_s = 0
+try:
+start_dt = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+uptime_s = int((datetime.now(timezone.utc) - start_dt).total_seconds())
+except Exception:
+pass
+
+return {
+"status": status,
+"health": health,
+"restart_count": restart_count,
+"uptime_s": uptime_s,
+"started_at": started_at,
+}
+except Exception as e:
+log("Erreur inspect " + nom_container + " : " + str(e)[:80], "WARN")
+return None
+
+
+def docker_ps_all():
+"""Liste tous les containers Docker reels."""
+if not DOCKER_DISPONIBLE:
+return []
+code, out, err = executer_commande(
+["docker", "ps", "-a", "--format",
+"{{.Names}}|{{.Status}}|{{.Image}}|{{.Ports}}"],
+timeout=5
+)
+if code != 0:
+return []
+resultats = []
+for ligne in out.strip().split("\n"):
+if not ligne.strip():
+continue
+parties = ligne.split("|")
+if len(parties) >= 4:
+resultats.append({
+"nom": parties[0],
+"status": parties[1],
+"image": parties[2],
+"ports": parties[3],
+})
+return resultats
+
+
+def docker_info_systeme():
+"""Recupere l'info systeme Docker."""
+if not DOCKER_DISPONIBLE:
+return None
+code, out, err = executer_commande(
+["docker", "info", "--format", "{{json .}}"],
+timeout=10
+)
+if code != 0:
+return None
+try:
+return json.loads(out)
+except Exception:
+return None
+
+
+# ===============================================================
+# HTTP HEALTH CHECK REEL
+# ===============================================================
+
+def http_health_check(url, timeout=3):
+"""Effectue un vrai GET sur l'endpoint de sante."""
+if not url:
+return None
+t0 = time.time()
+try:
+req = urllib.request.Request(url, headers={"User-Agent": "NexusMonitor/2.0"})
+with urllib.request.urlopen(req, timeout=timeout, context=CTX) as r:
+dt = (time.time() - t0) * 1000
+body = r.read(4096).decode("utf-8", "ignore")
+return {
+"ok": True,
+"status": r.status,
+"latence_ms": round(dt, 2),
+"reponse": body[:500],
+}
+except urllib.error.HTTPError as e:
+dt = (time.time() - t0) * 1000
+return {
+"ok": False,
+"status": e.code,
+"latence_ms": round(dt, 2),
+"erreur": "HTTP " + str(e.code),
+}
+except Exception as e:
+dt = (time.time() - t0) * 1000
+return {
+"ok": False,
+"status": 0,
+"latence_ms": round(dt, 2),
+"erreur": str(e)[:100],
+}
+
+
+def http_metrics_scrape(url, timeout=3):
+"""Scrape un endpoint /metrics Prometheus."""
+if not url:
+return None
+try:
+req = urllib.request.Request(url, headers={"User-Agent": "NexusMonitor/2.0"})
+with urllib.request.urlopen(req, timeout=timeout, context=CTX) as r:
+body = r.read(100000).decode("utf-8", "ignore")
+# Parse les metriques simples
+metriques = {}
+for ligne in body.split("\n"):
+if ligne.startswith("#") or not ligne.strip():
+continue
+m = re.match(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)\s+([\d.eE+-]+)", ligne)
+if m:
+try:
+metriques[m.group(1)] = float(m.group(2))
+except ValueError:
+pass
+return metriques
+except Exception:
+return None
+
+
+# ===============================================================
+# LECTURE SYSTEME REELLE (Linux)
+# ===============================================================
+
+def lire_cpu_systeme():
+"""Lit l'utilisation CPU reelle du systeme."""
+try:
+with open("/proc/stat", "r") as f:
+lignes = f.readlines()
+for ligne in lignes:
+if ligne.startswith("cpu "):
+parts = ligne.split()
+if len(parts) >= 5:
+user = int(parts[1])
+nice = int(parts[2])
+system = int(parts[3])
+idle = int(parts[4])
+total = user + nice + system + idle
+if total > 0:
+return round((total - idle) / total * 100, 2)
+except Exception:
+pass
+return None
+
+
+def lire_mem_systeme():
+"""Lit la memoire systeme reelle."""
+try:
+with open("/proc/meminfo", "r") as f:
+mem = {}
+for ligne in f:
+if ":" in ligne:
+k, v = ligne.split(":", 1)
+mem[k.strip()] = v.strip()
+total = int(mem.get("MemTotal", "0").split()[0]) / 1024
+dispo = int(mem.get("MemAvailable", "0").split()[0]) / 1024
+utilise = total - dispo
+pct = (utilise / total * 100) if total > 0 else 0
+return {
+"total_mo": round(total, 1),
+"utilise_mo": round(utilise, 1),
+"dispo_mo": round(dispo, 1),
+"pct": round(pct, 2),
+}
+except Exception:
+return None
+
+
+def lire_disque():
+"""Lit l'utilisation disque reelle."""
+try:
+st = os.statvfs("/")
+total = st.f_blocks * st.f_frsize
+libre = st.f_bavail * st.f_frsize
+utilise = total - libre
+pct = (utilise / total * 100) if total > 0 else 0
+return {
+"total_go": round(total / (1024**3), 2),
+"utilise_go": round(utilise / (1024**3), 2),
+"libre_go": round(libre / (1024**3), 2),
+"pct": round(pct, 2),
+}
+except Exception:
+return None
+
+
+def lire_uptime():
+"""Lit l'uptime systeme reel."""
+try:
+with open("/proc/uptime", "r") as f:
+return int(float(f.read().split()[0]))
+except Exception:
+return None
+
+
+def lire_loadavg():
+"""Lit le load average reel."""
+try:
+with open("/proc/loadavg", "r") as f:
+parts = f.read().split()
+return [float(parts[0]), float(parts[1]), float(parts[2])]
+except Exception:
+return None
+
+
+def lire_processus_top(n=5):
+"""Lit les top processus par CPU."""
+try:
+code, out, err = executer_commande(
+["ps", "aux", "--sort=-%cpu"],
+timeout=5
+)
+if code != 0:
+return []
+processus = []
+for ligne in out.split("\n")[1:n+1]:
+parties = ligne.split(None, 10)
+if len(parties) >= 11:
+try:
+processus.append({
+"user": parties[0],
+"pid": parties[1],
+"cpu": float(parties[2]),
+"ram": float(parties[3]),
+"commande": parties[10][:80],
+})
+except ValueError:
+continue
+return processus
+except Exception:
+return []
+
+
+# ===============================================================
+# INFO SYSTEME
+# ===============================================================
+
+def info_systeme():
+info = {
+"os": "?",
+"python": sys.version.split()[0],
+"machine": "?",
+"cpu_count": os.cpu_count() or 1,
+"hostname": "?",
+}
+try:
+import platform
+info["os"] = platform.system() + " " + platform.release()
+info["machine"] = platform.machine()
+except Exception:
+pass
+try:
+info["hostname"] = socket.gethostname()
+except Exception:
+pass
+return info
+
+
+# ===============================================================
+# ETAT GLOBAL & COLLECTE
+# ===============================================================
+
+ETAT = {
+"demarre_a": time.time(),
+"tick": 0,
+"historique_cpu": collections.deque(maxlen=60),
+"historique_ram": collections.deque(maxlen=60),
+"historique_latence": collections.deque(maxlen=60),
+"derniere_collecte": 0,
+}
+ETAT_LOCK = threading.RLock()
+
+
+def collecter_service(svc):
+"""Collecte l'etat REEL d'un service."""
+resultat = {
+"id": svc["id"],
+"nom": svc["nom"],
+"langage": svc["langage"],
+"port": svc["port"],
+"role": svc["role"],
+"couleur": svc["couleur"],
+"sources": [],
+}
+
+# 1. Test port TCP (reel)
+port_info = verifier_port_tcp("127.0.0.1", svc["port"])
+resultat["port_ouvert"] = port_info["ouvert"]
+resultat["latence_port_ms"] = port_info["latence_ms"]
+resultat["sources"].append("tcp_connect")
+
+# 2. Docker stats (reel si docker dispo)
+if DOCKER_DISPONIBLE:
+stats = docker_container_stats(svc["container"])
+if stats:
+resultat["cpu_pct"] = stats["cpu_pct"]
+resultat["ram_mo"] = stats["ram_mo"]
+resultat["ram_pct"] = stats["ram_pct"]
+resultat["net_io"] = stats["net_io"]
+resultat["block_io"] = stats["block_io"]
+resultat["sources"].append("docker_stats")
+
+inspect = docker_container_inspect(svc["container"])
+if inspect:
+resultat["docker_status"] = inspect["status"]
+resultat["docker_health"] = inspect["health"]
+resultat["restart_count"] = inspect["restart_count"]
+resultat["uptime_container_s"] = inspect["uptime_s"]
+resultat["sources"].append("docker_inspect")
+
+# 3. HTTP health check (reel)
+if svc["health_url"]:
+health = http_health_check(svc["health_url"])
+if health:
+resultat["http_status"] = health["status"]
+resultat["http_ok"] = health["ok"]
+resultat["http_latence_ms"] = health["latence_ms"]
+resultat["http_reponse"] = health.get("reponse", "")[:200]
+if "erreur" in health:
+resultat["http_erreur"] = health["erreur"]
+resultat["sources"].append("http_health")
+
+# 4. Metriques Prometheus si dispo
+if svc["health_url"]:
+metrics_url = svc["health_url"].replace("/health", "/metrics")
+metrics = http_metrics_scrape(metrics_url)
+if metrics:
+resultat["prometheus"] = metrics
+resultat["sources"].append("prometheus")
+
+# Calcul de la sante REELLE
+if not resultat["port_ouvert"]:
+resultat["sante"] = "KO"
+resultat["raison_sante"] = "port ferme"
+elif resultat.get("docker_status") and resultat["docker_status"] != "running":
+resultat["sante"] = "KO"
+resultat["raison_sante"] = "container non running"
+elif resultat.get("http_ok") is False:
+resultat["sante"] = "DEGRADEE"
+resultat["raison_sante"] = "HTTP KO : " + resultat.get("http_erreur", "")
+else:
+resultat["sante"] = "OK"
+resultat["raison_sante"] = "toutes verifications passees"
+
+return resultat
+
+
+def collecter_etat():
+"""Collecte l'etat complet REEL du systeme."""
+with ETAT_LOCK:
+ETAT["tick"] += 1
+tick = ETAT["tick"]
+
+sysinfo = info_systeme()
+
+# Systeme
+cpu_sys = lire_cpu_systeme()
+mem_sys = lire_mem_systeme()
+disque = lire_disque()
+uptime_sys = lire_uptime()
+loadavg = lire_loadavg()
+top_proc = lire_processus_top(5)
+
+# Docker global
+docker_containers = docker_ps_all() if DOCKER_DISPONIBLE else []
+docker_info = docker_info_systeme() if DOCKER_DISPONIBLE else None
+
+# Services
+services_data = [collecter_service(svc) for svc in SERVICES]
+
+# Agregat REEL
+services_ok = sum(1 for s in services_data if s["sante"] == "OK")
+services_ko = sum(1 for s in services_data if s["sante"] == "KO")
+services_deg = sum(1 for s in services_data if s["sante"] == "DEGRADEE")
+ports_ouverts = sum(1 for s in services_data if s["port_ouvert"])
+
+# Metriques agregees (reelles)
+cpu_moyen = 0.0
+ram_total = 0.0
+latence_moy = 0.0
+services_avec_cpu = 0
+
+for s in services_data:
+if "cpu_pct" in s:
+cpu_moyen += s["cpu_pct"]
+services_avec_cpu += 1
+if "ram_mo" in s:
+ram_total += s["ram_mo"]
+if "http_latence_ms" in s:
+latence_moy += s["http_latence_ms"]
+
+if services_avec_cpu > 0:
+cpu_moyen = round(cpu_moyen / services_avec_cpu, 2)
+if services_data:
+latence_moy = round(latence_moy / len(services_data), 2)
+
+with ETAT_LOCK:
+ETAT["historique_cpu"].append(cpu_sys if cpu_sys is not None else 0)
+ETAT["historique_ram"].append(mem_sys["pct"] if mem_sys else 0)
+ETAT["historique_latence"].append(latence_moy)
+ETAT["derniere_collecte"] = time.time()
+hist_cpu = list(ETAT["historique_cpu"])
+hist_ram = list(ETAT["historique_ram"])
+hist_lat = list(ETAT["historique_latence"])
+
+return {
+"version": VERSION,
+"auteur": AUTEUR,
+"licence": LICENCE,
+"timestamp": datetime.now(timezone.utc).isoformat(),
+"uptime_s": int(time.time() - ETAT["demarre_a"]),
+"tick": tick,
+"systeme": sysinfo,
+"docker": {
+"disponible": DOCKER_DISPONIBLE,
+"version": (docker_info or {}).get("ServerVersion") if docker_info else None,
+"containers_total": len(docker_containers),
+"containers": docker_containers[:20],
+},
+"ressources_systeme": {
+"cpu_pct": cpu_sys,
+"memoire": mem_sys,
+"disque": disque,
+"uptime_s": uptime_sys,
+"loadavg": loadavg,
+},
+"top_processus": top_proc,
+"services": services_data,
+"agregat": {
+"services_total": len(services_data),
+"services_ok": services_ok,
+"services_ko": services_ko,
+"services_deg": services_deg,
+"ports_ouverts": ports_ouverts,
+"cpu_moyen": cpu_moyen,
+"ram_total_mo": round(ram_total, 1),
+"latence_moyenne_ms": latence_moy,
+},
+"historique": {
+"cpu": hist_cpu,
+"ram": hist_ram,
+"latence": hist_lat,
+},
+}
+
+
+# ===============================================================
+# HTML DASHBOARD
+# ===============================================================
+
+HTML = r"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>NEXUS STAFF MONITOR</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%;overflow:hidden;background:#05000a;color:#c8ffd0;font-family:-apple-system,system-ui,sans-serif}
+#app{display:grid;grid-template-rows:auto 1fr auto;height:100vh}
+.top{padding:12px 20px;border-bottom:1px solid #1a3a2a;background:rgba(5,20,15,0.85);backdrop-filter:blur(18px);display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}
+.brand h1{font-size:18px;font-weight:700;letter-spacing:-1px;background:linear-gradient(135deg,#00ffc8,#00c8ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.brand .sub{color:#5a8a7a;font-size:10px;font-family:ui-monospace,monospace;margin-top:2px}
+.stats-top{display:flex;gap:16px;flex-wrap:wrap}
+.stat-mini{text-align:right}
+.stat-mini .lbl{color:#5a8a7a;font-size:9px;text-transform:uppercase;letter-spacing:1px}
+.stat-mini .val{color:#00ffc8;font-size:16px;font-weight:700;font-family:ui-monospace,monospace}
+.main{display:grid;grid-template-columns:1fr 380px;overflow:hidden}
+@media(max-width:1000px){.main{grid-template-columns:1fr}.sidebar{display:none}}
+.center{padding:16px;overflow-y:auto}
+.sidebar{padding:16px;border-left:1px solid #1a3a2a;overflow-y:auto;background:rgba(5,15,10,0.6)}
+.center::-webkit-scrollbar,.sidebar::-webkit-scrollbar{width:6px}
+.center::-webkit-scrollbar-thumb,.sidebar::-webkit-scrollbar-thumb{background:#1a3a2a;border-radius:3px}
+.section{margin-bottom:18px}
+.section h2{color:#00d4ff;font-size:11px;text-transform:uppercase;letter-spacing:2px;margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid #1a3a2a}
+.services{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px}
+.svc{background:rgba(5,20,15,0.7);border:1px solid #1a3a2a;border-radius:12px;padding:14px;transition:all 0.2s}
+.svc:hover{border-color:#00ffc8}
+.svc-header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px;gap:8px}
+.svc-name{font-weight:700;font-size:13px;color:#fff;display:flex;align-items:center;gap:8px}
+.dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.dot.ok{background:#00ff88;box-shadow:0 0 8px #00ff88}
+.dot.ko{background:#ff0050;box-shadow:0 0 8px #ff0050}
+.dot.deg{background:#ffc800;box-shadow:0 0 8px #ffc800}
+.svc-lang{font-size:9px;padding:2px 8px;border-radius:999px;background:rgba(0,200,255,0.15);color:#00c8ff;font-weight:700;letter-spacing:1px;text-transform:uppercase}
+.svc-role{color:#5a8a7a;font-size:10px;font-family:ui-monospace,monospace;margin-bottom:10px}
+.metrics{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.metric{background:rgba(0,0,0,0.3);padding:6px 8px;border-radius:6px}
+.metric .lbl{color:#5a8a7a;font-size:8px;text-transform:uppercase;letter-spacing:1px}
+.metric .val{color:#00ffc8;font-size:12px;font-weight:700;font-family:ui-monospace,monospace;word-break:break-all}
+.sources{margin-top:8px;font-size:8px;color:#5a8a7a;font-family:ui-monospace,monospace}
+.source-badge{display:inline-block;padding:1px 6px;border-radius:999px;background:rgba(0,255,200,0.1);color:#00ffc8;margin-right:3px;margin-bottom:2px;font-size:8px}
+.raison{margin-top:8px;padding:6px 8px;border-radius:6px;font-size:9px;font-family:ui-monospace,monospace}
+.raison.ok{background:rgba(0,255,136,0.1);color:#00ff88}
+.raison.ko{background:rgba(255,0,80,0.1);color:#ff0050}
+.raison.deg{background:rgba(255,200,0,0.1);color:#ffc800}
+.card-side{background:rgba(5,20,15,0.7);border:1px solid #1a3a2a;border-radius:10px;padding:12px;margin-bottom:12px}
+.card-side h3{color:#00ffc8;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px}
+.metric-line{display:flex;justify-content:space-between;font-size:10px;font-family:ui-monospace,monospace;padding:4px 0;border-bottom:1px solid rgba(26,58,42,0.4);gap:8px}
+.metric-line:last-child{border-bottom:none}
+.metric-line .k{color:#5a8a7a;flex-shrink:0}
+.metric-line .v{color:#00ffc8;font-weight:700;text-align:right;word-break:break-all}
+.chart{height:110px;background:rgba(0,0,0,0.3);border-radius:6px;margin-top:8px;position:relative;overflow:hidden}
+.chart svg{width:100%;height:100%}
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:9px;font-weight:700;letter-spacing:1px;text-transform:uppercase}
+.badge.ok{background:rgba(0,255,136,0.15);color:#00ff88}
+.badge.ko{background:rgba(255,0,80,0.15);color:#ff0050}
+.badge.warn{background:rgba(255,200,0,0.15);color:#ffc800}
+.badge.info{background:rgba(0,200,255,0.15);color:#00c8ff}
+.footer{padding:6px 20px;border-top:1px solid #1a3a2a;text-align:center;color:#3a4a4a;font-size:9px;font-family:ui-monospace,monospace;background:rgba(5,15,10,0.6)}
+.actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
+.btn{background:#00ffc8;color:#000;border:none;padding:7px 11px;border-radius:6px;font-weight:700;font-size:10px;cursor:pointer;font-family:inherit;text-transform:uppercase;letter-spacing:1px}
+.btn:hover{background:#00c8ff}
+.btn.alt{background:transparent;color:#00ffc8;border:1px solid #1a3a2a}
+.btn.alt:hover{background:rgba(0,255,200,0.1)}
+.proc-row{display:flex;justify-content:space-between;font-size:9px;font-family:ui-monospace,monospace;padding:3px 0;color:#5a8a7a;gap:6px}
+.proc-row .name{color:#00ffc8;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.warning{padding:8px 12px;background:rgba(255,200,0,0.1);border:1px solid rgba(255,200,0,0.3);border-radius:8px;color:#ffc800;font-size:10px;font-family:ui-monospace,monospace;margin-bottom:12px}
+</style>
+</head>
+<body>
+<div id="app">
+<div class="top">
+<div class="brand">
+<h1>NEXUS STAFF MONITOR</h1>
+<div class="sub">v__V__ · Aissa Mohammedi (DGK) · localhost:8088 · 100% REEL</div>
+</div>
+<div class="stats-top">
+<div class="stat-mini"><div class="lbl">Services OK</div><div class="val" id="top-ok">-</div></div>
+<div class="stat-mini"><div class="lbl">Ports ouverts</div><div class="val" id="top-ports">-</div></div>
+<div class="stat-mini"><div class="lbl">CPU sys</div><div class="val" id="top-cpu">-</div></div>
+<div class="stat-mini"><div class="lbl">RAM sys</div><div class="val" id="top-ram">-</div></div>
+<div class="stat-mini"><div class="lbl">Uptime</div><div class="val" id="top-up">-</div></div>
+</div>
+</div>
+
+<div class="main">
+<div class="center">
+<div id="warnings"></div>
+
+<div class="section">
+<h2>Services surveilles</h2>
+<div class="services" id="services">
+<div style="text-align:center;padding:40px;color:#5a8a7a;font-family:ui-monospace,monospace">Chargement...</div>
+</div>
+</div>
+
+<div class="section">
+<h2>Historique 60 points</h2>
+<div class="card-side">
+<div class="chart">
+<svg viewBox="0 0 400 100" preserveAspectRatio="none">
+<polyline id="line-cpu" fill="none" stroke="#00ffc8" stroke-width="2" points=""/>
+<polyline id="line-ram" fill="none" stroke="#ff00c8" stroke-width="2" points=""/>
+<polyline id="line-lat" fill="none" stroke="#ffc800" stroke-width="2" points=""/>
+</svg>
+</div>
+<div style="display:flex;gap:14px;margin-top:6px;font-size:9px;font-family:ui-monospace,monospace">
+<div><span style="color:#00ffc8">━</span> CPU %</div>
+<div><span style="color:#ff00c8">━</span> RAM %</div>
+<div><span style="color:#ffc800">━</span> Latence ms</div>
+</div>
+</div>
+</div>
+
+<div class="section">
+<h2>Top processus CPU</h2>
+<div class="card-side" id="proc">
+<div style="color:#5a8a7a;font-size:10px;font-family:ui-monospace,monospace">Chargement...</div>
+</div>
+</div>
+</div>
+
+<div class="sidebar">
+
+<div class="card-side">
+<h3>Systeme</h3>
+<div class="metric-line"><span class="k">OS</span><span class="v" id="s-os">-</span></div>
+<div class="metric-line"><span class="k">Host</span><span class="v" id="s-host">-</span></div>
+<div class="metric-line"><span class="k">Machine</span><span class="v" id="s-mach">-</span></div>
+<div class="metric-line"><span class="k">Python</span><span class="v" id="s-py">-</span></div>
+<div class="metric-line"><span class="k">CPU count</span><span class="v" id="s-cpu">-</span></div>
+<div class="metric-line"><span class="k">Load</span><span class="v" id="s-load">-</span></div>
+<div class="metric-line"><span class="k">Uptime sys</span><span class="v" id="s-up">-</span></div>
+</div>
+
+<div class="card-side">
+<h3>Ressources reelles</h3>
+<div class="metric-line"><span class="k">CPU</span><span class="v" id="r-cpu">-</span></div>
+<div class="metric-line"><span class="k">RAM</span><span class="v" id="r-ram">-</span></div>
+<div class="metric-line"><span class="k">Disque</span><span class="v" id="r-disk">-</span></div>
+</div>
+
+<div class="card-side">
+<h3>Docker</h3>
+<div class="metric-line"><span class="k">Disponible</span><span class="v" id="d-dispo">-</span></div>
+<div class="metric-line"><span class="k">Version</span><span class="v" id="d-ver">-</span></div>
+<div class="metric-line"><span class="k">Containers</span><span class="v" id="d-cnt">-</span></div>
+</div>
+
+<div class="card-side">
+<h3>Agregat services</h3>
+<div class="metric-line"><span class="k">Total</span><span class="v" id="a-total">-</span></div>
+<div class="metric-line"><span class="k">OK</span><span class="v" id="a-ok">-</span></div>
+<div class="metric-line"><span class="k">Degradees</span><span class="v" id="a-deg">-</span></div>
+<div class="metric-line"><span class="k">KO</span><span class="v" id="a-ko">-</span></div>
+<div class="metric-line"><span class="k">Ports ouverts</span><span class="v" id="a-ports">-</span></div>
+<div class="metric-line"><span class="k">CPU moy</span><span class="v" id="a-cpu">-</span></div>
+<div class="metric-line"><span class="k">RAM total</span><span class="v" id="a-ram">-</span></div>
+<div class="metric-line"><span class="k">Latence moy</span><span class="v" id="a-lat">-</span></div>
+</div>
+
+<div class="card-side">
+<h3>Containers Docker</h3>
+<div id="containers" style="font-size:9px;font-family:ui-monospace,monospace;color:#5a8a7a;max-height:200px;overflow-y:auto">
+Aucun
+</div>
+</div>
+
+<div class="card-side">
+<h3>Actions</h3>
+<div class="actions">
+<button class="btn" onclick="exporter()">JSON</button>
+<button class="btn alt" onclick="charger()">RAFRAICHIR</button>
+<button class="btn alt" onclick="voirReadme()">README</button>
+</div>
+</div>
+
+</div>
+</div>
+
+<div class="footer">NEXUS STAFF MONITOR v__V__ · Toutes les metriques proviennent de sources reelles · Aissa Mohammedi (DGK)</div>
+</div>
+
+<script>
+var etatCourant = null;
+
+function esc(s){return String(s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+
+function formatUptime(s){
+if(!s && s !== 0) return '-';
+var j = Math.floor(s/86400);
+var h = Math.floor((s%86400)/3600);
+var m = Math.floor((s%3600)/60);
+if(j > 0) return j+'j '+h+'h';
+if(h > 0) return h+'h '+m+'m';
+if(m > 0) return m+'m';
+return s+'s';
+}
+
+function renderServices(services){
+var el = document.getElementById('services');
+if(!services || !services.length){
+el.innerHTML = '<div style="text-align:center;padding:40px;color:#5a8a7a">Aucun service</div>';
+return;
+}
+var html = '';
+services.forEach(function(s){
+var dotClass = s.sante === 'OK' ? 'ok' : (s.sante === 'KO' ? 'ko' : 'deg');
+var raisonClass = s.sante === 'OK' ? 'ok' : (s.sante === 'KO' ? 'ko' : 'deg');
+html += '<div class="svc">';
+html += '<div class="svc-header">';
+html += '<div class="svc-name"><span class="dot '+dotClass+'"></span>'+esc(s.nom)+'</div>';
+html += '<span class="svc-lang">'+esc(s.langage)+'</span>';
+html += '</div>';
+html += '<div class="svc-role">'+esc(s.role)+' · port '+s.port+'</div>';
+html += '<div class="metrics">';
+html += '<div class="metric"><div class="lbl">Port</div><div class="val">'+(s.port_ouvert ? 'OUVERT' : 'FERME')+'</div></div>';
+if('cpu_pct' in s){
+html += '<div class="metric"><div class="lbl">CPU</div><div class="val">'+s.cpu_pct+'%</div></div>';
+}
+if('ram_mo' in s){
+html += '<div class="metric"><div class="lbl">RAM</div><div class="val">'+s.ram_mo+' Mo</div></div>';
+}
+if('http_latence_ms' in s){
+html += '<div class="metric"><div class="lbl">HTTP lat</div><div class="val">'+s.http_latence_ms+' ms</div></div>';
+}
+if('http_status' in s){
+html += '<div class="metric"><div class="lbl">HTTP</div><div class="val">'+s.http_status+'</div></div>';
+}
+if('uptime_container_s' in s){
+html += '<div class="metric"><div class="lbl">Uptime</div><div class="val">'+formatUptime(s.uptime_container_s)+'</div></div>';
+}
+if('restart_count' in s){
+html += '<div class="metric"><div class="lbl">Restarts</div><div class="val">'+s.restart_count+'</div></div>';
+}
+html += '</div>';
+if(s.sources && s.sources.length){
+html += '<div class="sources">';
+s.sources.forEach(function(src){ html += '<span class="source-badge">'+esc(src)+'</span>'; });
+html += '</div>';
+}
+html += '<div class="raison '+raisonClass+'">'+esc(s.sante)+' · '+esc(s.raison_sante||'-')+'</div>';
+html += '</div>';
+});
+el.innerHTML = html;
+}
+
+function renderChart(hist){
+if(!hist || !hist.cpu || hist.cpu.length < 2) return;
+var W = 400, H = 100;
+var n = hist.cpu.length;
+var maxCpu = Math.max.apply(null, hist.cpu) || 100;
+var maxRam = Math.max.apply(null, hist.ram) || 100;
+var maxLat = Math.max.apply(null, hist.latence) || 100;
+if(maxCpu === 0) maxCpu = 1;
+if(maxRam === 0) maxRam = 1;
+if(maxLat === 0) maxLat = 1;
+
+var cpuPts = [], ramPts = [], latPts = [];
+hist.cpu.forEach(function(v, i){
+var x = (i / (n-1)) * W;
+cpuPts.push(x.toFixed(1)+','+(H - (v/maxCpu)*H).toFixed(1));
+ramPts.push(x.toFixed(1)+','+(H - (hist.ram[i]/maxRam)*H).toFixed(1));
+latPts.push(x.toFixed(1)+','+(H - (hist.latence[i]/maxLat)*H).toFixed(1));
+});
+document.getElementById('line-cpu').setAttribute('points', cpuPts.join(' '));
+document.getElementById('line-ram').setAttribute('points', ramPts.join(' '));
+document.getElementById('line-lat').setAttribute('points', latPts.join(' '));
+}
+
+function renderProcs(procs){
+var el = document.getElementById('proc');
+if(!procs || !procs.length){
+el.innerHTML = '<div style="color:#5a8a7a;font-size:10px">Indisponible</div>';
+return;
+}
+var html = '';
+procs.forEach(function(p){
+html += '<div class="proc-row">';
+html += '<span class="name">'+esc(p.commande)+'</span>';
+html += '<span>'+p.cpu.toFixed(1)+'%</span>';
+html += '<span>'+p.ram.toFixed(1)+'%</span>';
+html += '</div>';
+});
+el.innerHTML = html;
+}
+
+function renderContainers(containers){
+var el = document.getElementById('containers');
+if(!containers || !containers.length){
+el.innerHTML = 'Aucun container';
+return;
+}
+var html = '';
+containers.forEach(function(c){
+html += '<div style="padding:3px 0;border-bottom:1px solid rgba(26,58,42,0.3)">';
+html += '<span style="color:#00ffc8">'+esc(c.nom)+'</span><br>';
+html += '<span>'+esc(c.status.slice(0, 40))+'</span>';
+html += '</div>';
+});
+el.innerHTML = html;
+}
+
+function render(d){
+etatCourant = d;
+
+document.getElementById('top-ok').textContent = d.agregat.services_ok + '/' + d.agregat.services_total;
+document.getElementById('top-ports').textContent = d.agregat.ports_ouverts + '/' + d.agregat.services_total;
+document.getElementById('top-cpu').textContent = (d.ressources_systeme.cpu_pct || 0) + '%';
+document.getElementById('top-ram').textContent = (d.ressources_systeme.memoire ? d.ressources_systeme.memoire.pct : 0) + '%';
+document.getElementById('top-up').textContent = formatUptime(d.uptime_s);
+
+renderServices(d.services);
+renderChart(d.historique);
+renderProcs(d.top_processus);
+renderContainers(d.docker.containers);
+
+// Systeme
+var s = d.systeme;
+document.getElementById('s-os').textContent = s.os || '-';
+document.getElementById('s-host').textContent = s.hostname || '-';
+document.getElementById('s-mach').textContent = s.machine || '-';
+document.getElementById('s-py').textContent = s.python || '-';
+document.getElementById('s-cpu').textContent = s.cpu_count || '-';
+if(d.ressources_systeme.loadavg){
+document.getElementById('s-load').textContent = d.ressources_systeme.loadavg.map(function(x){return x.toFixed(2);}).join(' / ');
+}
+document.getElementById('s-up').textContent = formatUptime(d.ressources_systeme.uptime_s);
+
+// Ressources
+document.getElementById('r-cpu').textContent = (d.ressources_systeme.cpu_pct !== null ? d.ressources_systeme.cpu_pct + '%' : 'N/A');
+if(d.ressources_systeme.memoire){
+document.getElementById('r-ram').textContent = d.ressources_systeme.memoire.utilise_mo + ' / ' + d.ressources_systeme.memoire.total_mo + ' Mo';
+}
+if(d.ressources_systeme.disque){
+document.getElementById('r-disk').textContent = d.ressources_systeme.disque.utilise_go + ' / ' + d.ressources_systeme.disque.total_go + ' Go';
+}
+
+// Docker
+document.getElementById('d-dispo').textContent = d.docker.disponible ? 'OUI' : 'NON';
+document.getElementById('d-ver').textContent = d.docker.version || '-';
+document.getElementById('d-cnt').textContent = d.docker.containers_total;
+
+// Agregat
+document.getElementById('a-total').textContent = d.agregat.services_total;
+document.getElementById('a-ok').textContent = d.agregat.services_ok;
+document.getElementById('a-deg').textContent = d.agregat.services_deg;
+document.getElementById('a-ko').textContent = d.agregat.services_ko;
+document.getElementById('a-ports').textContent = d.agregat.ports_ouverts;
+document.getElementById('a-cpu').textContent = d.agregat.cpu_moyen + '%';
+document.getElementById('a-ram').textContent = d.agregat.ram_total_mo + ' Mo';
+document.getElementById('a-lat').textContent = d.agregat.latence_moyenne_ms + ' ms';
+
+// Warnings
+var w = document.getElementById('warnings');
+var warns = [];
+if(!d.docker.disponible) warns.push('Docker non disponible - les metriques de containers ne peuvent pas etre lues');
+if(d.agregat.ports_ouverts === 0) warns.push('Aucun service n\'ecoute sur les ports attendus (5432, 6379, 8000, 8080, 8001, 3000, 3001)');
+if(warns.length){
+w.innerHTML = warns.map(function(x){return '<div class="warning">'+esc(x)+'</div>';}).join('');
+} else {
+w.innerHTML = '';
+}
+}
+
+async function charger(){
+try{
+var r = await fetch('/api/state');
+var d = await r.json();
+render(d);
+}catch(e){
+console.error(e);
+}
+}
+
+function exporter(){
+if(!etatCourant){ alert('Rien a exporter'); return; }
+var blob = new Blob([JSON.stringify(etatCourant, null, 2)], {type:'application/json'});
+var a = document.createElement('a');
+a.href = URL.createObjectURL(blob);
+a.download = 'nexus_monitor_' + Date.now() + '.json';
+a.click();
+}
+
+function voirReadme(){
+window.open('/readme', '_blank');
+}
+
+charger();
+setInterval(charger, 3000);
+</script>
+</body>
+</html>"""
+
+
+README_TEXT = """NEXUS STAFF ENGINEER MONITOR
+Auteur : Aissa Mohammedi (DGK)
+Licence : NEXUS-OPEN-2.0
+Version : """ + VERSION + """
+
+============================================================
+100% REEL — AUCUNE SIMULATION
+============================================================
+
+Chaque metrique affichee dans ce dashboard provient d'une source reelle :
+
+1. PORT TCP (socket connect)
+Teste si un service ecoute vraiment sur 127.0.0.1:PORT
+Source : socket.connect_ex()
+Fichier : verifier_port_tcp()
+
+2. DOCKER STATS (docker stats --no-stream)
+Lit le CPU %, RAM Mo, RAM %, Net IO, Block IO reels des containers
+Source : subprocess -> docker stats
+Fichier : docker_container_stats()
+
+3. DOCKER INSPECT (docker inspect)
+Lit le status, health, restart count, uptime reel des containers
+Source : subprocess -> docker inspect
+Fichier : docker_container_inspect()
+
+4. HTTP HEALTH (GET /health)
+Effectue un vrai GET HTTP sur l'endpoint de sante de chaque service
+Mesure la latence reelle en millisecondes
+Source : urllib.request
+Fichier : http_health_check()
+
+5. PROMETHEUS METRICS (GET /metrics)
+Scrape les metriques Prometheus si l'endpoint existe
+Source : urllib.request
+Fichier : http_metrics_scrape()
+
+6. SYSTEME (lecture /proc)
+CPU % : /proc/stat
+RAM : /proc/meminfo
+Disque : os.statvfs("/")
+Uptime : /proc/uptime
+Load : /proc/loadavg
+Top processus : ps aux --sort=-%cpu
+
+============================================================
+CE QUI EST REEL vs CE QUI EST ABSENT
+============================================================
+
+REEL si tu lances les services :
+- Port ouvert / ferme
+- Docker CPU / RAM / IO
+- Docker status / health / restarts
+- HTTP status / latence / reponse
+- CPU / RAM / disque systeme
+- Top processus
+- Containers Docker
+
+ABSENT (pas de simulation) :
+- Si Docker n'est pas installe : les metriques Docker ne sont pas affichees
+- Si un service ne repond pas : la ligne s'affiche "KO" avec la raison
+- Si /metrics n'existe pas : la section Prometheus est vide
+
+============================================================
+LANCER LE DASHBOARD
+============================================================
+
+python3 nexus_staff_monitor.py
+
+Ouvrir :
+http://localhost:8088/
+
+============================================================
+DEPLOYER LES 7 SERVICES (optionnel, pour tester en reel)
+============================================================
+
+Fichier docker-compose.yml :
+
+version: '3.9'
+services:
+postgres:
+image: postgres:16-alpine
+container_name: nexus-postgres
+ports: ["5432:5432"]
+environment:
+POSTGRES_USER: nexus_user
+POSTGRES_PASSWORD: ChangeMe123!
+POSTGRES_DB: nexus_prod
+
+redis:
+image: redis:7-alpine
+container_name: nexus-redis
+ports: ["6379:6379"]
+
+nexus-python:
+build: ./nexus-python
+container_name: nexus-python
+ports: ["8000:8000"]
+
+nexus-java:
+build: ./nexus-java
+container_name: nexus-java
+ports: ["8080:8080"]
+
+nexus-go:
+build: ./nexus-go
+container_name: nexus-go
+ports: ["8001:8000"]
+
+nexus-rust:
+build: ./nexus-rust
+container_name: nexus-rust
+ports: ["3000:3000"]
+
+nexus-ts:
+build: ./nexus-typescript
+container_name: nexus-ts
+ports: ["3001:3001"]
+
+Lancer :
+docker compose up -d
+
+Verifier :
+docker compose ps
+
+Le dashboard affichera alors les vraies metriques des 7 containers.
+
+============================================================
+COMPORTEMENT SI RIEN N'EST LANCE
+============================================================
+
+Si tu lances le dashboard sans services :
+
+- Services OK : 0/7
+- Ports ouverts : 0/7
+- Chaque service affiche "KO · port ferme"
+- Docker : disponible ou non selon ton systeme
+- CPU / RAM / disque systeme : REELS
+- Top processus : REELS
+- Aucune metrique inventee
+
+C'est ca le vrai monitoring : il te dit la verite.
+
+============================================================
+LICENCE
+============================================================
+
+NEXUS-OPEN-2.0 - Copyright (c) 2026 Aissa Mohammedi (DGK)
+"""
+
+
+# ===============================================================
+# SERVEUR HTTP
+# ===============================================================
+
+ETAT_CACHE = {"data": None, "ts": 0}
+ETAT_CACHE_LOCK = threading.RLock()
+
+
+def get_etat():
+now = time.time()
+with ETAT_CACHE_LOCK:
+if ETAT_CACHE["data"] is None or now - ETAT_CACHE["ts"] > 2:
+ETAT_CACHE["data"] = collecter_etat()
+ETAT_CACHE["ts"] = now
+return ETAT_CACHE["data"]
+
+
+class Handler(BaseHTTPRequestHandler):
+def log_message(self, *a):
+pass
+
+def _send(self, code, content, ctype="application/json"):
+try:
+gz = None
+if len(content) > 500 and "gzip" in self.headers.get("Accept-Encoding", ""):
+content = gzip.compress(content, 6)
+gz = "gzip"
+self.send_response(code)
+self.send_header("Content-Type", ctype + "; charset=utf-8")
+self.send_header("Access-Control-Allow-Origin", "*")
+if gz:
+self.send_header("Content-Encoding", gz)
+self.send_header("Content-Length", str(len(content)))
+self.end_headers()
+self.wfile.write(content)
+except (BrokenPipeError, ConnectionResetError):
+pass
+
+def _json(self, obj, code=200):
+self._send(code, json.dumps(obj, ensure_ascii=False, default=str).encode("utf-8"))
+
+def _html(self, html):
+self._send(200, html.encode("utf-8"), "text/html")
+
+def _text(self, txt):
+self._send(200, txt.encode("utf-8"), "text/plain")
+
+def do_GET(self):
+try:
+p = self.path.split("?")[0]
+if p in ("/", "/index.html"):
+return self._html(HTML.replace("__V__", VERSION))
+if p == "/api/state":
+return self._json(get_etat())
+if p == "/readme":
+return self._text(README_TEXT)
+if p == "/api/health":
+return self._json({"status": "ok", "version": VERSION})
+return self._json({"erreur": "not found"}, 404)
+except Exception as e:
+log("Erreur GET : " + str(e)[:150], "ERR")
+return self._json({"erreur": str(e)[:200]}, 500)
+
+
+def main():
+server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+server.daemon_threads = True
+
+print("=" * 70)
+print(" NEXUS STAFF ENGINEER MONITOR v" + VERSION)
+print(" Auteur : Aissa Mohammedi (DGK)")
+print(" Licence : NEXUS-OPEN-2.0")
+print("=" * 70)
+print()
+print(" Dashboard : http://localhost:" + str(PORT) + "/")
+print(" API : http://localhost:" + str(PORT) + "/api/state")
+print(" README : http://localhost:" + str(PORT) + "/readme")
+print()
+print(" MODE : 100% REEL - aucune simulation")
+print()
+print(" Sources de donnees reelles :")
+print(" - socket.connect_ex() pour les ports TCP")
+print(" - docker stats pour CPU / RAM / IO")
+print(" - docker inspect pour status / health / restarts")
+print(" - urllib.request pour HTTP health checks")
+print(" - /proc/stat, /proc/meminfo pour le systeme")
+print(" - ps aux pour le top processus")
+print()
+print(" Docker disponible : " + ("OUI" if DOCKER_DISPONIBLE else "NON"))
+print(" Port : " + str(PORT))
+print()
+print(" Ctrl+C pour arreter.")
+print()
+try:
+server.serve_forever()
+except KeyboardInterrupt:
+print("\nArrete.")
+
+
+if __name__ == "__main__":
+main()
