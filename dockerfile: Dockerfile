@@ -1,0 +1,184 @@
+# NEXUS STAFF ENGINEER STACK
+# Author: Aissa Mohammedi (DGK)
+# License: NEXUS-OPEN-2.0
+# Version: 2.0.0
+# Compatible with Nexus Staff Monitor v2.0.0 (100% REAL metrics)
+
+version: '3.9'
+
+services:
+# --- CORE DATA LAYER ---
+postgres:
+image: postgres:16-alpine
+container_name: nexus-postgres
+restart: unless-stopped
+ports:
+- "5432:5432"
+environment:
+POSTGRES_USER: ${POSTGRES_USER:-nexus_user}
+POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ChangeMe123!_Prod}
+POSTGRES_DB: ${POSTGRES_DB:-nexus_prod}
+volumes:
+- postgres_data:/var/lib/postgresql/data
+- ./nexus-db/migrations:/docker-entrypoint-initdb.d:ro
+healthcheck:
+test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-nexus_user} -d ${POSTGRES_DB:-nexus_prod}"]
+interval: 10s
+timeout: 5s
+retries: 5
+networks:
+- nexus-network
+
+redis:
+image: redis:7-alpine
+container_name: nexus-redis
+restart: unless-stopped
+ports:
+- "6379:6379"
+command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru --appendonly yes
+volumes:
+- redis_data:/data
+healthcheck:
+test: ["CMD", "redis-cli", "ping"]
+interval: 10s
+timeout: 3s
+retries: 5
+networks:
+- nexus-network
+
+# --- APPLICATION LAYER ---
+nexus-python:
+build:
+context: ./nexus-python
+dockerfile: Dockerfile
+image: nexus-python:latest
+container_name: nexus-python
+restart: unless-stopped
+ports:
+- "8000:8000"
+depends_on:
+postgres:
+condition: service_healthy
+redis:
+condition: service_healthy
+environment:
+DATABASE_URL: postgresql://${POSTGRES_USER:-nexus_user}:${POSTGRES_PASSWORD:-ChangeMe123!_Prod}@postgres:5432/${POSTGRES_DB:-nexus_prod}
+REDIS_URL: redis://redis:6379/0
+PORT: 8000
+healthcheck:
+test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:8000/health"]
+interval: 15s
+timeout: 5s
+retries: 3
+networks:
+- nexus-network
+
+nexus-java:
+build:
+context: ./nexus-java
+dockerfile: Dockerfile
+image: nexus-java:latest
+container_name: nexus-java
+restart: unless-stopped
+ports:
+- "8080:8080"
+depends_on:
+postgres:
+condition: service_healthy
+environment:
+SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-nexus_prod}
+SPRING_DATASOURCE_USERNAME: ${POSTGRES_USER:-nexus_user}
+SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:-ChangeMe123!_Prod}
+healthcheck:
+test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:8080/actuator/health"]
+interval: 15s
+timeout: 5s
+retries: 3
+networks:
+- nexus-network
+
+nexus-go:
+build:
+context: ./nexus-go
+dockerfile: Dockerfile
+image: nexus-go:latest
+container_name: nexus-go
+restart: unless-stopped
+ports:
+- "8001:8000"
+depends_on:
+postgres:
+condition: service_healthy
+redis:
+condition: service_healthy
+environment:
+DATABASE_URL: postgresql://${POSTGRES_USER:-nexus_user}:${POSTGRES_PASSWORD:-ChangeMe123!_Prod}@postgres:5432/${POSTGRES_DB:-nexus_prod}
+REDIS_URL: redis://redis:6379/0
+healthcheck:
+test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:8000/health"]
+interval: 15s
+timeout: 5s
+retries: 3
+networks:
+- nexus-network
+
+nexus-rust:
+build:
+context: ./nexus-rust
+dockerfile: Dockerfile
+image: nexus-rust:latest
+container_name: nexus-rust
+restart: unless-stopped
+ports:
+- "3000:3000"
+depends_on:
+postgres:
+condition: service_healthy
+redis:
+condition: service_healthy
+environment:
+DATABASE_URL: postgresql://${POSTGRES_USER:-nexus_user}:${POSTGRES_PASSWORD:-ChangeMe123!_Prod}@postgres:5432/${POSTGRES_DB:-nexus_prod}
+healthcheck:
+test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:3000/health"]
+interval: 15s
+timeout: 5s
+retries: 3
+networks:
+- nexus-network
+
+nexus-ts:
+build:
+context: ./nexus-typescript
+dockerfile: Dockerfile
+image: nexus-ts:latest
+container_name: nexus-ts
+restart: unless-stopped
+ports:
+- "3001:3001"
+depends_on:
+postgres:
+condition: service_healthy
+redis:
+condition: service_healthy
+environment:
+DATABASE_URL: postgresql://${POSTGRES_USER:-nexus_user}:${POSTGRES_PASSWORD:-ChangeMe123!_Prod}@postgres:5432/${POSTGRES_DB:-nexus_prod}
+REDIS_URL: redis://redis:6379/0
+PORT: 3001
+healthcheck:
+test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:3001/health"]
+interval: 15s
+timeout: 5s
+retries: 3
+networks:
+- nexus-network
+
+volumes:
+postgres_data:
+driver: local
+redis_data:
+driver: local
+
+networks:
+nexus-network:
+driver: bridge
+name: nexus-network
